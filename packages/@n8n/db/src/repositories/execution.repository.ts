@@ -753,6 +753,7 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		createdAt: true,
 		startedAt: true,
 		stoppedAt: true,
+		usedPrivateCredentials: true,
 	};
 
 	private annotationFields = {
