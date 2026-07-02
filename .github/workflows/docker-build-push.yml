@@ -28,7 +28,9 @@ jobs:
           cache: 'pnpm'
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        # --ignore-scripts skips native module compilation (sqlite3, isolated-vm, etc.)
+        # Docker handles native builds at image build time
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Build n8n
         run: pnpm build:n8n
