@@ -31,15 +31,21 @@ import {
 import { reconstructSeedFromThread, type SeedThreadRef } from './langsmith-seed';
 import { type EvalLogger } from './logger';
 import { fetchPrebuiltBuild } from './prebuilt-workflows';
+import { extractErrorMessage, isTransientNetworkError, MAX_EXEC_ATTEMPTS } from './transient-error';
 import { buildWorkflowContextBlock } from './workflow-context';
 import { SONNET_MODEL } from '../../src/utils/eval-agents';
 import { runBinaryChecks } from '../binaryChecks/index';
 import type { BinaryCheckContext, CheckOutcome } from '../binaryChecks/types';
+import { selectAuthorExpectations } from '../build-expectations/select';
 import { allFailVerdicts, verifyBuildExpectations } from '../build-expectations/verifier';
 import { type VerifierAttemptDebug, verifyChecklist } from '../checklist/verifier';
 import { N8nApiError, type N8nClient, type WorkflowResponse } from '../clients/n8n-client';
 import { createDeclaredCredentials } from '../credentials/seeder';
-import { buildConversationMetrics, extractOutcomeFromEvents } from '../outcome/event-parser';
+import {
+	buildConversationMetrics,
+	extractOutcomeFromEvents,
+	mergeSeededConversationMetrics,
+} from '../outcome/event-parser';
 import { buildTranscriptFromEvents } from '../outcome/transcript-from-events';
 import { buildAgentOutcome, extractWorkflowIdsFromMessages } from '../outcome/workflow-discovery';
 import type {
@@ -57,7 +63,12 @@ import type {
 	WorkflowTestCase,
 	WorkflowTestCaseResult,
 } from '../types';
-import { failedBuildsPerTurn, userTurnsAsText } from '../utils/conversation-text';
+import {
+	conversationUserTurnsAsText,
+	failedBuildsPerTurn,
+	lastAgentText,
+	userTurnsAsText,
+} from '../utils/conversation-text';
 import { UserProxyLlm, type ProxyDecisionStats } from '../utils/user-proxy';
 
 // ---------------------------------------------------------------------------
@@ -209,10 +220,12 @@ export async function runWorkflowTestCase(
 			});
 
 	if (config.prebuiltWorkflowId && build.success && !build.workflowChecks) {
-		// No transcript in prebuilt mode — checks run with empty prompt context.
+		// No transcript in prebuilt mode, but the authored conversation still
+		// carries the user's request — feed it so prompt-aware checks (e.g.
+		// fulfills_user_request) grade against real intent instead of "".
 		build.workflowChecks = await runWorkflowChecks({
 			workflow: build.workflowJsons[0],
-			prompt: '',
+			prompt: conversationUserTurnsAsText(testCase.conversation),
 			agentText: undefined,
 			logger,
 		});
@@ -234,21 +247,28 @@ export async function runWorkflowTestCase(
 		result.workflowChecks = build.workflowChecks;
 	}
 
-	// Optional author build expectations — informational, judged concurrently with scenarios.
-	const wantsExpectations =
-		(testCase.buildExpectations?.length ?? 0) > 0 && (build.transcript?.length ?? 0) > 0;
-	const expectationsPromise: Promise<BuildExpectationResult[]> = wantsExpectations
-		? verifyBuildExpectations(testCase.buildExpectations!, {
-				transcript: build.transcript!,
-				workflowJson: build.workflowJsons[0],
-				metrics: build.conversationMetrics,
-			}).catch((error: unknown) => {
-				logger.warn(
-					`  Build expectations judge errored: ${error instanceof Error ? error.message : String(error)}`,
-				);
-				return allFailVerdicts(testCase.buildExpectations!, 'judge error');
-			})
-		: Promise.resolve<BuildExpectationResult[]>([]);
+	// Optional author expectations — informational, judged concurrently with scenarios.
+	const { expectations: expectationsToJudge, transcript: expectationsTranscript } =
+		selectAuthorExpectations({
+			testCase,
+			transcript: build.transcript,
+			buildSucceeded: build.success,
+			isPrebuilt: config.prebuiltWorkflowId !== undefined,
+			logger,
+		});
+	const expectationsPromise: Promise<BuildExpectationResult[]> =
+		expectationsToJudge.length > 0
+			? verifyBuildExpectations(expectationsToJudge, {
+					transcript: expectationsTranscript,
+					workflowJson: build.workflowJsons[0],
+					metrics: build.conversationMetrics,
+				}).catch((error: unknown) => {
+					logger.warn(
+						`  Author expectations judge errored: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					return allFailVerdicts(expectationsToJudge, 'judge error');
+				})
+			: Promise.resolve<BuildExpectationResult[]>([]);
 
 	if (!build.success || !build.workflowId) {
 		result.buildError = build.error;
@@ -265,29 +285,44 @@ export async function runWorkflowTestCase(
 
 	const scenarioStart = Date.now();
 	const scenariosPromise = runWithConcurrency(
-		testCase.executionScenarios,
+		testCase.executionScenarios ?? [],
 		async (scenario) => {
-			try {
-				return await executeScenario(
-					client,
-					build.workflowId!,
-					scenario,
-					build.workflowJsons,
-					logger,
-					timeoutMs,
-					testCaseArtifactName,
-					build.buildTrace,
-					config.pinAiRoots,
-				);
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : String(error);
-				logger.error(`    ERROR [${scenario.name}]: ${errorMessage}`);
-				return {
-					scenario,
-					success: false,
-					score: 0,
-					reasoning: `Error: ${errorMessage}`,
-				} satisfies ExecutionScenarioResult;
+			for (let attempt = 1; ; attempt++) {
+				try {
+					return await executeScenario(
+						client,
+						build.workflowId!,
+						scenario,
+						build.workflowJsons,
+						logger,
+						timeoutMs,
+						testCaseArtifactName,
+						build.buildTrace,
+						config.pinAiRoots,
+					);
+				} catch (error: unknown) {
+					const errorMessage = extractErrorMessage(error);
+					if (isTransientNetworkError(errorMessage) && attempt < MAX_EXEC_ATTEMPTS) {
+						logger.warn(
+							`    [${scenario.name}] execution attempt ${attempt}/${MAX_EXEC_ATTEMPTS} failed (${errorMessage}); retrying`,
+						);
+						await delay(500 * attempt);
+						continue;
+					}
+					// executeScenario categorizes builder/mock/verification failures
+					// internally; an error escaping it is an infra/framework problem
+					// (network drop, n8n API error, verifier timeout). Tag it
+					// framework_issue so the report and baseline keep it out of builder
+					// regressions instead of scoring it as an uncategorized failure.
+					logger.error(`    ERROR [${scenario.name}]: ${errorMessage}`);
+					return {
+						scenario,
+						success: false,
+						score: 0,
+						reasoning: `Scenario execution error: ${errorMessage}`,
+						failureCategory: 'framework_issue',
+					} satisfies ExecutionScenarioResult;
+				}
 			}
 		},
 		MAX_CONCURRENT_SCENARIOS,
@@ -607,7 +642,10 @@ export async function buildWorkflow(config: BuildWorkflowConfig): Promise<BuildR
 		abortController.abort();
 		await ssePromise.catch(() => {});
 
-		const conversationMetrics = buildConversationMetrics(events);
+		const conversationMetrics = mergeSeededConversationMetrics(
+			seededTranscript,
+			buildConversationMetrics(events),
+		);
 		const transcript = [
 			...seededTranscript,
 			...buildTranscriptFromEvents({
@@ -633,7 +671,8 @@ export async function buildWorkflow(config: BuildWorkflowConfig): Promise<BuildR
 			...new Set([...eventOutcome.workflowIds, ...messageWorkflowIds, ...restoredWorkflowIds]),
 		];
 		const buildTrace: BuildTrace = {
-			finalText: eventOutcome.finalText,
+			finalText:
+				eventOutcome.finalText.length > 0 ? eventOutcome.finalText : lastAgentText(transcript),
 			toolCalls: eventOutcome.toolCalls,
 			agentActivities: eventOutcome.agentActivities,
 		};
@@ -1188,6 +1227,12 @@ export async function runWorkflowChecks(args: {
 		if (failed.length > 0) {
 			args.logger.info(
 				`  Workflow checks: ${String(failed.length)} failing (${failed.map((o) => o.name).join(', ')})`,
+			);
+		}
+		const errored = outcomes.filter((o) => o.status === 'error');
+		if (errored.length > 0) {
+			args.logger.warn(
+				`  Workflow checks: ${String(errored.length)} errored, excluded from scoring (${errored.map((o) => o.name).join(', ')})`,
 			);
 		}
 		return outcomes;
