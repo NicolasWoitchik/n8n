@@ -27,10 +27,11 @@ jobs:
           node-version: '24'
           cache: 'pnpm'
 
+      - name: Install build tools
+        run: sudo apt-get install -y python3 make g++
+
       - name: Install dependencies
-        # --ignore-scripts skips native module compilation (sqlite3, isolated-vm, etc.)
-        # Docker handles native builds at image build time
-        run: pnpm install --frozen-lockfile --ignore-scripts
+        run: pnpm install --frozen-lockfile
 
       - name: Build n8n
         run: pnpm build:n8n
